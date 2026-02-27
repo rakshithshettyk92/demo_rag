@@ -23,7 +23,7 @@ from src.llm_config import get_llm, get_embeddings
 load_dotenv()
 
 TOP_K   = int(os.getenv("TOP_K_RESULTS", 8))
-DB_PATH = os.getenv("VECTORSTORE_PATH", "./vectorstore")
+DB_PATH = os.getenv("SECURITY_STORE_PATH", "./vectorstore/security")
 
 # Common security abbreviations → full form.
 # Used to expand the query before retrieval so the embedding search
@@ -71,6 +71,8 @@ SECURITY_PROMPT = """You are a cybersecurity assistant. \
 Your ONLY knowledge source is the documentation excerpts provided below.
 
 STRICT RULES — follow without exception:
+0. Sections marked [ADMIN VERIFIED CORRECTION] are the highest-priority source. \
+   They represent manually verified answers — always use them when present and treat them as definitive.
 1. Use ONLY the context below. Never use outside knowledge, training data, or assumptions.
 2. If the context contains a clear answer, provide it and cite the exact source document and page number for every claim.
 3. IMPORTANT — if multiple source documents give DIFFERENT values for the same thing (e.g. different names, dates, or roles), report ALL of them. State which document says what, and note that the documents differ. Do not pick just one.
@@ -134,6 +136,20 @@ class SecurityRAGChain:
         if doc_count == 0:
             print("⚠️  WARNING: No documents indexed yet! Run quickstart.py first.")
 
+        # Corrections store — admin-verified overrides, same persist_dir
+        try:
+            from src.security.corrections import CorrectionsStore
+            self._corrections = CorrectionsStore(
+                persist_dir=persist_dir,
+                embeddings=self.embeddings,
+            )
+            n = self._corrections.count()
+            if n:
+                print(f"✏️  Corrections loaded: {n} admin-verified answer(s)")
+        except Exception as e:
+            print(f"⚠️  Corrections store unavailable: {e}")
+            self._corrections = None
+
         # MMR (Maximum Marginal Relevance): fetches fetch_k candidates by similarity,
         # then selects k diverse ones. Prevents returning 10 chunks from the same
         # document section and ensures results span different parts of the corpus.
@@ -157,6 +173,22 @@ class SecurityRAGChain:
             | StrOutputParser()
         )
 
+    def _get_correction_context(self, question: str) -> str:
+        """Return formatted admin corrections for this question, or empty string."""
+        if not self._corrections:
+            return ""
+        try:
+            corr_docs = self._corrections.search(question, k=2)
+            if not corr_docs:
+                return ""
+            parts = [
+                f"[ADMIN VERIFIED CORRECTION — treat as authoritative]\n{d.page_content}"
+                for d in corr_docs
+            ]
+            return "\n\n---\n\n".join(parts) + "\n\n---\n\n"
+        except Exception:
+            return ""
+
     def _retrieve(self, question: str):
         """Retrieve docs once and cache them for the current turn.
         Query is expanded first to handle abbreviations like CISO, MFA, DR, etc."""
@@ -166,8 +198,9 @@ class SecurityRAGChain:
         return docs
 
     def ask(self, question: str, return_sources: bool = True) -> Dict[str, Any]:
+        correction_ctx = self._get_correction_context(question)
         docs    = self._retrieve(question)
-        context = format_docs(docs)
+        context = correction_ctx + format_docs(docs)
         answer  = (
             {"context": lambda _: context, "question": RunnablePassthrough()}
             | self.prompt
@@ -193,9 +226,10 @@ class SecurityRAGChain:
         If no docs pass the similarity threshold, yield a not-found message immediately
         without calling the LLM at all.
         """
+        correction_ctx = self._get_correction_context(question)
         docs = self._retrieve(question)
 
-        if not docs:
+        if not docs and not correction_ctx:
             yield (
                 f"**{NOT_FOUND_PREFIX}**\n\n"
                 "No sections in the indexed security documents matched your question "
@@ -204,7 +238,7 @@ class SecurityRAGChain:
             )
             return
 
-        context = format_docs(docs)
+        context = correction_ctx + format_docs(docs)
         stream_chain = (
             {"context": lambda _: context, "question": RunnablePassthrough()}
             | self.prompt

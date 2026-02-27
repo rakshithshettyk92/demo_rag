@@ -43,7 +43,7 @@ load_dotenv()
 
 CHUNK_SIZE                = int(os.getenv("CHUNK_SIZE", 800))
 CHUNK_OVERLAP             = int(os.getenv("CHUNK_OVERLAP", 150))
-DB_PATH                   = os.getenv("VECTORSTORE_PATH", "./vectorstore")
+DB_PATH                   = os.getenv("SECURITY_STORE_PATH", "./vectorstore/security")
 OCR_EXTRA_CHARS_THRESHOLD = int(os.getenv("OCR_EXTRA_CHARS_THRESHOLD", 150))
 OCR_DPI                   = int(os.getenv("OCR_DPI", 200))
 OLLAMA_VISION_MODEL       = os.getenv("OLLAMA_VISION_MODEL", "llava")

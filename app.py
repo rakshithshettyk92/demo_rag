@@ -19,13 +19,31 @@ import gradio as gr
 from datetime import datetime
 
 # ── RAG chain (lazy loaded so UI starts fast) ─────────────────
-_rag = None
+_rag         = None
+_corrections = None
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "solum-admin")
+
+
+def get_corrections():
+    """Return the CorrectionsStore, reusing the RAG chain's embeddings if ready."""
+    global _corrections
+    if _corrections is None:
+        try:
+            from src.security.corrections import CorrectionsStore
+            db_path = os.getenv("SECURITY_STORE_PATH", "./vectorstore/security")
+            embeddings = getattr(_rag, "embeddings", None) if _rag else None
+            _corrections = CorrectionsStore(persist_dir=db_path, embeddings=embeddings)
+        except Exception as e:
+            print(f"Corrections store init error: {e}")
+            return None
+    return _corrections
+
 
 def get_rag(provider: str):
     global _rag
     try:
         from src.security.rag_chain import SecurityRAGChain
-        db_path = os.getenv("VECTORSTORE_PATH", "./vectorstore")
+        db_path = os.getenv("SECURITY_STORE_PATH", "./vectorstore/security")
         if _rag is None:
             _rag = SecurityRAGChain(llm_provider=provider, persist_dir=db_path)
         else:
@@ -41,37 +59,42 @@ def get_rag(provider: str):
 def chat(question: str, history: list, model: str):
     question = question.strip()
     if not question:
-        return history, ""
+        return history, "", "", ""
+
+    # Show placeholder immediately so the UI never looks frozen
+    history = history + [
+        {"role": "user",      "content": question},
+        {"role": "assistant", "content": "⏳ Loading model..."},
+    ]
+    yield history, "", question, ""
 
     rag, err = get_rag(model)
     if err:
-        history.append({"role": "user", "content": question})
-        history.append({"role": "assistant", "content": f"⚠️ Could not connect: {err}"})
-        return history, ""
+        history[-1] = {"role": "assistant", "content": f"⚠️ Could not connect: {err}"}
+        yield history, "", question, ""
+        return
 
-    # Add user message
-    history.append({"role": "user", "content": question})
-    # Add placeholder assistant message
-    history.append({"role": "assistant", "content": "▌"})
-    yield history, ""
+    # Model ready — now searching docs
+    history[-1] = {"role": "assistant", "content": "🔍 Searching documents..."}
+    yield history, "", question, ""
 
     try:
         full_answer = ""
         for token in rag.ask_stream(question):
+            if not full_answer:
+                history[-1] = {"role": "assistant", "content": token + "▌"}
+            else:
+                history[-1] = {"role": "assistant", "content": full_answer + token + "▌"}
             full_answer += token
-            history[-1] = {"role": "assistant", "content": full_answer + "▌"}
-            yield history, ""
+            yield history, "", question, ""
 
         history[-1] = {"role": "assistant", "content": full_answer}
-        yield history, ""
+        yield history, "", question, full_answer
 
-        # Match the exact prefix the prompt instructs the LLM to use.
-        # Only show references when the answer is grounded in retrieved docs.
         from src.security.rag_chain import NOT_FOUND_PREFIX
         answered = NOT_FOUND_PREFIX.lower() not in full_answer.lower()
 
         if answered:
-            # Reuse the docs already retrieved during ask_stream — no second DB call.
             source_docs = getattr(rag, "_last_docs", [])
             if source_docs:
                 seen = set()
@@ -87,15 +110,15 @@ def chat(question: str, history: list, model: str):
                 if refs:
                     final = full_answer + "\n\n---\n**References:**\n" + "\n".join(refs)
                     history[-1] = {"role": "assistant", "content": final}
-                    yield history, ""
+                    yield history, "", question, full_answer
 
     except Exception as e:
         history[-1] = {"role": "assistant", "content": f"❌ Error: {e}"}
-        yield history, ""
+        yield history, "", question, ""
 
 
 def clear_chat():
-    return [], ""
+    return [], "", "", ""
 
 
 # ── CSS ───────────────────────────────────────────────────────
@@ -348,6 +371,48 @@ button.clear-btn:hover {
     50% { opacity: 0.4; }
 }
 
+/* ── Admin UI ── */
+.admin-toggle-btn {
+    background: transparent !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    color: var(--muted) !important;
+    font-size: 1rem !important;
+    padding: 6px 10px !important;
+    cursor: pointer !important;
+    transition: all 0.15s !important;
+    min-width: 40px !important;
+}
+.admin-toggle-btn:hover {
+    border-color: #f59e0b !important;
+    color: #f59e0b !important;
+}
+.admin-badge {
+    background: rgba(245,158,11,0.12);
+    border: 1px solid rgba(245,158,11,0.35);
+    border-radius: 8px;
+    padding: 6px 14px;
+    color: #f59e0b;
+    font-size: 0.82rem;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.admin-panel {
+    border: 1px solid rgba(245,158,11,0.3) !important;
+    border-radius: 12px !important;
+    padding: 16px !important;
+    margin-top: 12px !important;
+    background: var(--surface) !important;
+}
+.pwd-row input {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    color: var(--text) !important;
+}
+
 /* Tab styling */
 .tabs > .tab-nav { border-bottom: 1px solid var(--border) !important; }
 .tabs > .tab-nav button {
@@ -399,9 +464,95 @@ HOME_HTML = """
 """
 
 
+# ── Admin helpers ─────────────────────────────────────────────
+def _try_unlock(pwd):
+    if pwd == ADMIN_PASSWORD:
+        return (
+            gr.update(visible=False),   # pwd_row
+            gr.update(visible=True),    # admin_badge_row
+            gr.update(visible=True),    # admin_panel
+            True,                        # is_admin_state
+            gr.update(value="🔓"),      # admin_toggle_btn label
+            "",                          # clear pwd_input
+            "",                          # clear pwd_error
+        )
+    return (
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        False,
+        gr.update(value="🔒"),
+        "",
+        "<span style='color:#ef4444'>❌ Incorrect password</span>",
+    )
+
+
+def _do_lock():
+    return (
+        gr.update(visible=False),   # pwd_row
+        gr.update(visible=False),   # admin_badge_row
+        gr.update(visible=False),   # admin_panel
+        False,                       # is_admin_state
+        gr.update(value="🔒"),      # admin_toggle_btn
+    )
+
+
+def _save_correction(question, answer, source_ref):
+    if not question:
+        return "<span style='color:#f59e0b'>⚠️ Ask a question first, then click Load Last Answer.</span>"
+    if not answer.strip():
+        return "<span style='color:#f59e0b'>⚠️ Please enter the correct answer.</span>"
+    try:
+        store = get_corrections()
+        cid = store.add(question, answer.strip(), corrected_by="admin", source_ref=source_ref)
+        return f"<span style='color:#10b981'>✅ Correction saved! (ID: {cid[:8]}...)</span>"
+    except Exception as e:
+        return f"<span style='color:#ef4444'>❌ Error saving: {e}</span>"
+
+
+def _list_corrections():
+    try:
+        store = get_corrections()
+        items = store.list_all()
+        if not items:
+            return []
+        return [
+            [
+                c["id"][:8],
+                (c["question"][:70] + "...") if len(c["question"]) > 70 else c["question"],
+                (c["answer"][:90] + "...")   if len(c["answer"])   > 90 else c["answer"],
+                c["by"],
+                c["timestamp"][:19].replace("T", " "),
+            ]
+            for c in items
+        ]
+    except Exception:
+        return []
+
+
+def _delete_correction(id_prefix):
+    if not id_prefix.strip():
+        return "<span style='color:#f59e0b'>⚠️ Enter the first 8 chars of the ID to delete.</span>", _list_corrections()
+    try:
+        store = get_corrections()
+        matched = [c for c in store.list_all() if c["id"].startswith(id_prefix.strip())]
+        if not matched:
+            return "<span style='color:#f59e0b'>⚠️ No correction found with that ID prefix.</span>", _list_corrections()
+        for c in matched:
+            store.delete(c["id"])
+        return f"<span style='color:#10b981'>✅ Deleted {len(matched)} correction(s).</span>", _list_corrections()
+    except Exception as e:
+        return f"<span style='color:#ef4444'>❌ Error: {e}</span>", _list_corrections()
+
+
 # ── BUILD UI ──────────────────────────────────────────────────
 def build():
     with gr.Blocks(title="SOLUM AI Platform") as demo:
+
+        # ── Shared state ──────────────────────────────────────
+        is_admin_state = gr.State(False)
+        last_q_state   = gr.State("")
+        last_a_state   = gr.State("")
 
         with gr.Tabs() as tabs:
 
@@ -413,22 +564,46 @@ def build():
             with gr.TabItem("🔐  Security"):
                 with gr.Column(elem_classes="chat-page"):
 
-                    # Header
-                    gr.HTML("""
-                    <div class="chat-header">
-                        <div>
-                            <div style="display:flex; align-items:center; gap:10px;">
-                                <span style="font-family:'Syne',sans-serif; font-size:1.3rem; font-weight:700;">
-                                    Security Assistant
-                                </span>
-                                <span class="status-pill">
-                                    <span class="status-dot"></span> Active
-                                </span>
+                    # Header row with admin lock button
+                    with gr.Row(equal_height=True):
+                        gr.HTML("""
+                        <div class="chat-header" style="flex:1; margin:0;">
+                            <div>
+                                <div style="display:flex; align-items:center; gap:10px;">
+                                    <span style="font-family:'Syne',sans-serif; font-size:1.3rem; font-weight:700;">
+                                        Security Assistant
+                                    </span>
+                                    <span class="status-pill">
+                                        <span class="status-dot"></span> Active
+                                    </span>
+                                </div>
+                                <div class="back-hint">Ask about incident response, security policies, disaster recovery, and more</div>
                             </div>
-                            <div class="back-hint">Ask about incident response, security policies, disaster recovery, and more</div>
                         </div>
-                    </div>
-                    """)
+                        """)
+                        admin_toggle_btn = gr.Button(
+                            "🔒",
+                            elem_classes="admin-toggle-btn",
+                            scale=0,
+                            min_width=44,
+                        )
+
+                    # Password row (hidden by default)
+                    with gr.Row(visible=False, elem_classes="pwd-row") as pwd_row:
+                        pwd_input  = gr.Textbox(
+                            placeholder="Enter admin password...",
+                            type="password",
+                            show_label=False,
+                            scale=4,
+                            container=False,
+                        )
+                        unlock_btn = gr.Button("Unlock", scale=1, min_width=80, variant="primary")
+                    pwd_error = gr.HTML("")
+
+                    # Admin badge (hidden until logged in)
+                    with gr.Row(visible=False) as admin_badge_row:
+                        gr.HTML('<div class="admin-badge">🔓 Admin Mode Active</div>')
+                        lock_btn = gr.Button("🔒 Lock", scale=0, min_width=90, size="sm")
 
                     # Chatbot
                     chatbot = gr.Chatbot(
@@ -466,6 +641,44 @@ def build():
                         show_label=False,
                         elem_classes="model-radio",
                     )
+
+                    # ── Admin panel (hidden until logged in) ───
+                    with gr.Column(visible=False, elem_classes="admin-panel") as admin_panel:
+                        gr.HTML("<div style='color:#f59e0b; font-family:Syne,sans-serif; font-weight:700; font-size:0.95rem; margin-bottom:12px;'>⚙️ Admin Controls</div>")
+
+                        with gr.Accordion("✏️ Correct Last Answer", open=True):
+                            load_last_btn = gr.Button("📥 Load Last Answer", size="sm")
+                            corr_q_box    = gr.Textbox(label="Question", interactive=False)
+                            corr_a_box    = gr.Textbox(
+                                label="Correct Answer",
+                                lines=6,
+                                placeholder="Enter the correct answer here...",
+                            )
+                            corr_src_box  = gr.Textbox(
+                                label="Source Reference (optional)",
+                                placeholder="e.g. Security Policy v1.6, page 23",
+                            )
+                            with gr.Row():
+                                save_corr_btn = gr.Button("💾 Save Correction", variant="primary", scale=2)
+                                corr_status   = gr.HTML("", scale=3)
+
+                        with gr.Accordion("📋 Manage Corrections", open=False):
+                            corr_df = gr.Dataframe(
+                                headers=["ID (8 chars)", "Question", "Answer", "By", "Saved At"],
+                                datatype=["str", "str", "str", "str", "str"],
+                                wrap=True,
+                                label=None,
+                            )
+                            with gr.Row():
+                                refresh_corr_btn = gr.Button("🔄 Refresh", scale=1)
+                                del_id_box       = gr.Textbox(
+                                    label="ID prefix to delete",
+                                    placeholder="First 8 chars of ID",
+                                    scale=3,
+                                    container=False,
+                                )
+                                del_corr_btn = gr.Button("🗑️ Delete", variant="stop", scale=1)
+                            del_status = gr.HTML("")
 
             # ── Tab 3: ESL Tags (placeholder) ─────────────────
             with gr.TabItem("🏷️  ESL Tags"):
@@ -510,17 +723,73 @@ def build():
                 """)
 
         # ── Wire events ───────────────────────────────────────
+
+        # Chat
         send_btn.click(
             fn=chat,
             inputs=[question_box, chatbot, model_selector],
-            outputs=[chatbot, question_box],
+            outputs=[chatbot, question_box, last_q_state, last_a_state],
         )
         question_box.submit(
             fn=chat,
             inputs=[question_box, chatbot, model_selector],
-            outputs=[chatbot, question_box],
+            outputs=[chatbot, question_box, last_q_state, last_a_state],
         )
-        clear_btn.click(fn=clear_chat, outputs=[chatbot, question_box])
+        clear_btn.click(
+            fn=clear_chat,
+            outputs=[chatbot, question_box, last_q_state, last_a_state],
+        )
+
+        # Admin: show password row on lock button click
+        admin_toggle_btn.click(
+            fn=lambda: gr.update(visible=True),
+            outputs=[pwd_row],
+        )
+
+        # Admin: validate password
+        unlock_btn.click(
+            fn=_try_unlock,
+            inputs=[pwd_input],
+            outputs=[pwd_row, admin_badge_row, admin_panel, is_admin_state, admin_toggle_btn, pwd_input, pwd_error],
+        )
+        pwd_input.submit(
+            fn=_try_unlock,
+            inputs=[pwd_input],
+            outputs=[pwd_row, admin_badge_row, admin_panel, is_admin_state, admin_toggle_btn, pwd_input, pwd_error],
+        )
+
+        # Admin: lock
+        lock_btn.click(
+            fn=_do_lock,
+            outputs=[pwd_row, admin_badge_row, admin_panel, is_admin_state, admin_toggle_btn],
+        )
+
+        # Admin: populate correction form from last Q&A
+        load_last_btn.click(
+            fn=lambda q, a: (q, a),
+            inputs=[last_q_state, last_a_state],
+            outputs=[corr_q_box, corr_a_box],
+        )
+
+        # Admin: save correction
+        save_corr_btn.click(
+            fn=_save_correction,
+            inputs=[corr_q_box, corr_a_box, corr_src_box],
+            outputs=[corr_status],
+        )
+
+        # Admin: list corrections
+        refresh_corr_btn.click(
+            fn=_list_corrections,
+            outputs=[corr_df],
+        )
+
+        # Admin: delete correction
+        del_corr_btn.click(
+            fn=_delete_correction,
+            inputs=[del_id_box],
+            outputs=[del_status, corr_df],
+        )
 
     return demo
 
