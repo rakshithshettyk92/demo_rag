@@ -6,6 +6,9 @@
 pdfs/
 vectorstore/
 
+# Company profile data (customer data, not for version control)
+src/esl/profiles/*.json
+
 # Python
 __pycache__/
 *.py[cod]
