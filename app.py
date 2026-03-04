@@ -442,11 +442,11 @@ HOME_HTML = """
         <p>Ask questions about incident response, policies, and security procedures</p>
         <span class="badge badge-live">● Live</span>
     </div>
-    <div class="feature-card" onclick="document.querySelectorAll('[role=tab]')[2].click()">
+    <div class="feature-card">
         <div class="icon">🏷️</div>
         <h3>ESL Tag Generator</h3>
-        <p>AI-powered XSL template designer — describe your label, get production-ready files</p>
-        <span class="badge badge-live">● Live</span>
+        <p>Generate electronic shelf label content from product data automatically</p>
+        <span class="badge badge-soon">Coming Soon</span>
     </div>
     <div class="feature-card">
         <div class="icon">📖</div>
@@ -543,166 +543,6 @@ def _delete_correction(id_prefix):
         return f"<span style='color:#10b981'>✅ Deleted {len(matched)} correction(s).</span>", _list_corrections()
     except Exception as e:
         return f"<span style='color:#ef4444'>❌ Error: {e}</span>", _list_corrections()
-
-
-# ── ESL quick-start prompts ───────────────────────────────────
-ESL_PROMPTS = {
-    "regular": (
-        "White background. "
-        "Product name bold centered at the very top, Arial font, auto-fit text to width. "
-        "Item ID small text top-right corner. "
-        "Display page number bold large top-left. "
-        "A black bordered rectangle on the bottom-left half. "
-        "Inside that box: static label 'UNIT PRICE' small at the top of the box, "
-        "then UNIT_PRICE value large bold centered, then UNIT_PRICE_UNIT small at the bottom. "
-        "LIST_PRICE large bold centered on the bottom-right half. "
-        "Barcode top-right area, 160px wide 18px tall. "
-        "End date and pack quantity small text near the top. "
-        "Use Arial throughout."
-    ),
-    "sale": (
-        "White background. "
-        "Product name bold centered at the top, Arial, auto-fit. "
-        "Large SALE price (LIST_PRICE) bold Arial 44pt centered-right, bottom half. "
-        "Smaller original price (UNIT_PRICE) with strikethrough above the sale price. "
-        "Static red bold text 'SALE' label top-left corner. "
-        "A black bordered box bottom-left containing static 'UNIT PRICE' label and UNIT_PRICE_UNIT. "
-        "Barcode top-right 160px wide 18px tall. "
-        "Item ID small top-right below barcode. "
-        "End date small bottom center. "
-        "Use Arial throughout."
-    ),
-    "clearance": (
-        "Yellow background banner across the top quarter. White background for the rest. "
-        "Static bold text 'CLEARANCE' in large font on the yellow banner, centered. "
-        "Product name bold centered below the banner, Arial, auto-fit. "
-        "Large clearance price (LIST_PRICE) bold Arial 48pt centered right side. "
-        "Unit price small in a bordered box bottom-left with static 'UNIT PRICE' label. "
-        "Barcode bottom-right 140px wide 18px tall. "
-        "Item ID small text top-right. "
-        "Use Arial throughout."
-    ),
-}
-
-
-# ── ESL profile helpers ───────────────────────────────────────
-def _esl_profile_choices():
-    try:
-        from src.esl.profile_store import list_profile_choices
-        return list_profile_choices()
-    except Exception:
-        return []
-
-
-def _esl_save_profile(company_code: str, fields_json: str):
-    if not company_code.strip():
-        return (
-            "<span style='color:#f59e0b'>⚠️ Enter a company code before saving.</span>",
-            _esl_profile_choices(),
-        )
-    try:
-        from src.esl.profile_store import save_profile
-        msg = save_profile(company_code, fields_json)
-        return (
-            f"<span style='color:#10b981'>✅ {msg}</span>",
-            _esl_profile_choices(),
-        )
-    except Exception as e:
-        return (
-            f"<span style='color:#ef4444'>❌ {e}</span>",
-            _esl_profile_choices(),
-        )
-
-
-def _esl_load_profile(choice: str):
-    """Parse company code from dropdown choice label and load fields JSON."""
-    if not choice:
-        return "", "<span style='color:#f59e0b'>⚠️ Select a profile first.</span>"
-    try:
-        from src.esl.profile_store import fields_json_from_profile
-        # Choice format: "ACME  —  ACME Corp  (7 fields)"  or  "ACME  (7 fields)"
-        company_code = choice.split("—")[0].split("(")[0].strip()
-        fields_json = fields_json_from_profile(company_code)
-        return (
-            fields_json,
-            f"<span style='color:#10b981'>✅ Loaded profile: {company_code}</span>",
-        )
-    except Exception as e:
-        return (
-            "",
-            f"<span style='color:#ef4444'>❌ {e}</span>",
-        )
-
-
-def _esl_upload_fields(file):
-    """Read uploaded JSON file and return its content as a string."""
-    if file is None:
-        return ""
-    try:
-        with open(file.name, "r", encoding="utf-8") as f:
-            content = f.read()
-        import json
-        parsed = json.loads(content)
-        return json.dumps(parsed, indent=2, ensure_ascii=False)
-    except Exception as e:
-        return f"// Error reading file: {e}"
-
-
-# ── ESL template generator handler ───────────────────────────
-def _generate_esl(fields_json: str, description: str, size_key: str, provider: str):
-    """Generate XSL + Fabric JSON from product fields and description."""
-    if not description.strip():
-        return (
-            "<span style='color:#f59e0b'>⚠️ Please enter a layout description.</span>",
-            "", "", None, None,
-        )
-    if not fields_json.strip():
-        return (
-            "<span style='color:#f59e0b'>⚠️ Please enter product fields JSON.</span>",
-            "", "", None, None,
-        )
-
-    yield (
-        "<span style='color:#64748b'>⏳ Generating layout spec with AI...</span>",
-        "", "", None, None,
-    )
-
-    try:
-        from src.esl.template_service import get_service
-        service = get_service()
-
-        yield (
-            "<span style='color:#64748b'>🔍 Building XSL and JSON files...</span>",
-            "", "", None, None,
-        )
-
-        xsl_content, fabric_json, _ = service.generate(
-            fields_json=fields_json,
-            description=description,
-            size_key=size_key,
-            provider=provider,
-        )
-
-        # Write temp files for download buttons
-        import tempfile, os
-        xsl_tmp  = tempfile.NamedTemporaryFile(delete=False, suffix=".xsl",  mode="w", encoding="utf-8")
-        json_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w", encoding="utf-8")
-        xsl_tmp.write(xsl_content);  xsl_tmp.close()
-        json_tmp.write(fabric_json); json_tmp.close()
-
-        yield (
-            "<span style='color:#10b981'>✅ Template generated successfully!</span>",
-            xsl_content,
-            fabric_json,
-            xsl_tmp.name,
-            json_tmp.name,
-        )
-
-    except Exception as e:
-        yield (
-            f"<span style='color:#ef4444'>❌ Error: {e}</span>",
-            "", "", None, None,
-        )
 
 
 # ── BUILD UI ──────────────────────────────────────────────────
@@ -840,179 +680,19 @@ def build():
                                 del_corr_btn = gr.Button("🗑️ Delete", variant="stop", scale=1)
                             del_status = gr.HTML("")
 
-            # ── Tab 3: ESL Template Generator ─────────────────
+            # ── Tab 3: ESL Tags (placeholder) ─────────────────
             with gr.TabItem("🏷️  ESL Tags"):
-                with gr.Column(elem_classes="chat-page"):
-                    gr.HTML("""
-                    <div class="chat-header" style="margin-bottom:8px;">
-                        <div>
-                            <div style="display:flex; align-items:center; gap:10px;">
-                                <span style="font-family:'Syne',sans-serif; font-size:1.3rem; font-weight:700;">
-                                    ESL Template Generator
-                                </span>
-                                <span class="status-pill">
-                                    <span class="status-dot"></span> AI-Powered
-                                </span>
-                            </div>
-                            <div class="back-hint">
-                                Describe your label layout — AI generates the XSL template + designer JSON
-                            </div>
-                        </div>
+                gr.HTML("""
+                <div style="text-align:center; padding:80px 20px; color:#475569;">
+                    <div style="font-size:3rem; margin-bottom:16px;">🏷️</div>
+                    <div style="font-family:Syne,sans-serif; font-size:1.4rem; font-weight:700; 
+                                color:#e2e8f0; margin-bottom:8px;">ESL Tag Generator</div>
+                    <div style="font-size:0.9rem; line-height:1.6; max-width:400px; margin:0 auto;">
+                        Generate electronic shelf label content from product data.<br>
+                        <strong style="color:#3b82f6;">Coming soon</strong>
                     </div>
-                    """)
-
-                    # ── Row 1: ESL size + AI model ────────────────
-                    with gr.Row():
-                        esl_size_dd = gr.Dropdown(
-                            choices=["2.5\" (296×152)"],
-                            value="2.5\" (296×152)",
-                            label="ESL Size",
-                            scale=1,
-                        )
-                        esl_model_dd = gr.Radio(
-                            choices=[
-                                ("🦙  Llama 3.2", "ollama"),
-                                ("💎  Gemma 3", "gemma"),
-                                ("✦  Claude", "anthropic"),
-                                ("⬡  GPT-4o", "openai"),
-                            ],
-                            value="ollama",
-                            label="AI Model",
-                            scale=3,
-                            elem_classes="model-radio",
-                        )
-
-                    # ── Row 2: Company profile bar ────────────────
-                    gr.HTML("<div style='font-size:0.75rem; color:#64748b; margin:12px 0 4px; text-transform:uppercase; letter-spacing:0.08em; font-weight:500;'>Company Field Profile</div>")
-                    with gr.Row():
-                        esl_profile_dd = gr.Dropdown(
-                            choices=_esl_profile_choices(),
-                            value=None,
-                            label="Load saved profile",
-                            scale=3,
-                            allow_custom_value=False,
-                        )
-                        esl_load_profile_btn = gr.Button("Load", scale=1, min_width=80)
-                        esl_company_code_box = gr.Textbox(
-                            label="Company Code",
-                            placeholder="e.g. ACME or RETAILCO_SAP",
-                            scale=2,
-                            max_lines=1,
-                        )
-                        esl_save_profile_btn = gr.Button("Save Profile", scale=1, min_width=110)
-                    esl_profile_status = gr.HTML("")
-
-                    # ── Row 3: Fields — upload or paste ──────────
-                    gr.HTML("<div style='font-size:0.75rem; color:#64748b; margin:12px 0 4px; text-transform:uppercase; letter-spacing:0.08em; font-weight:500;'>Product Fields</div>")
-                    with gr.Row():
-                        esl_upload = gr.File(
-                            label="Upload fields JSON file",
-                            file_types=[".json"],
-                            scale=1,
-                        )
-                        esl_fields_box = gr.Textbox(
-                            label="Or paste / edit fields JSON directly",
-                            value='{\n  "ITEM_NAME": "string",\n  "LIST_PRICE": "decimal",\n  "UNIT_PRICE": "decimal",\n  "UNIT_PRICE_UNIT": "string",\n  "ITEM_ID": "string",\n  "PACK_QUANTITY": "string",\n  "END_DATE": "string"\n}',
-                            lines=10,
-                            scale=3,
-                        )
-
-                    # ── Row 4: Prompt guide ───────────────────────
-                    with gr.Accordion("💡 How to describe your label  (click to expand)", open=False):
-                        gr.HTML("""
-                        <div style="font-size:0.85rem; line-height:1.8; color:#cbd5e1; padding:8px 4px;">
-
-                        <div style="color:#3b82f6; font-weight:700; font-size:0.9rem; margin-bottom:8px;">
-                            Write your description as plain sentences. Cover these points:
-                        </div>
-
-                        <table style="width:100%; border-collapse:collapse; font-size:0.82rem;">
-                          <tr style="border-bottom:1px solid #1e2130;">
-                            <td style="padding:6px 12px 6px 0; color:#94a3b8; white-space:nowrap; vertical-align:top;">📐 Background</td>
-                            <td style="padding:6px 0;">"White background" · "Yellow background" · "Red top banner, white body"</td>
-                          </tr>
-                          <tr style="border-bottom:1px solid #1e2130;">
-                            <td style="padding:6px 12px 6px 0; color:#94a3b8; white-space:nowrap; vertical-align:top;">🔤 Product name</td>
-                            <td style="padding:6px 0;">"Product name bold centered at top, Arial 20pt, fits in one line"</td>
-                          </tr>
-                          <tr style="border-bottom:1px solid #1e2130;">
-                            <td style="padding:6px 12px 6px 0; color:#94a3b8; white-space:nowrap; vertical-align:top;">💲 Price</td>
-                            <td style="padding:6px 0;">"Large sale price center-right, bold Arial 44pt" · "Crossed-out original price above in small grey"</td>
-                          </tr>
-                          <tr style="border-bottom:1px solid #1e2130;">
-                            <td style="padding:6px 12px 6px 0; color:#94a3b8; white-space:nowrap; vertical-align:top;">📦 Unit price</td>
-                            <td style="padding:6px 0;">"Unit price in a bordered box on the left, label 'UNIT PRICE' above it"</td>
-                          </tr>
-                          <tr style="border-bottom:1px solid #1e2130;">
-                            <td style="padding:6px 12px 6px 0; color:#94a3b8; white-space:nowrap; vertical-align:top;">📊 Barcode</td>
-                            <td style="padding:6px 0;">"Barcode bottom-left" · "Barcode top-right, 160px wide, 18px tall"</td>
-                          </tr>
-                          <tr style="border-bottom:1px solid #1e2130;">
-                            <td style="padding:6px 12px 6px 0; color:#94a3b8; white-space:nowrap; vertical-align:top;">🪧 Other fields</td>
-                            <td style="padding:6px 0;">"Item ID small top-right" · "Pack quantity small near product name" · "End date small bottom"</td>
-                          </tr>
-                          <tr>
-                            <td style="padding:6px 12px 6px 0; color:#94a3b8; white-space:nowrap; vertical-align:top;">✏️ Font / style</td>
-                            <td style="padding:6px 0;">"Use Arial throughout" · "Price bold and red" · "Product name italic"</td>
-                          </tr>
-                        </table>
-
-                        <div style="margin-top:14px; padding:10px 14px; background:#0a0c10; border-radius:8px; border-left:3px solid #3b82f6;">
-                            <div style="color:#64748b; font-size:0.75rem; margin-bottom:4px;">GOOD EXAMPLE</div>
-                            <div style="color:#e2e8f0; font-style:italic;">
-                            "White background. Product name bold centered at the top, Arial, auto-fit text.
-                            Large list price center-right, bold Arial 44pt. Unit price in a black bordered box
-                            bottom-left with a small static label 'UNIT PRICE' above it. Barcode bottom-right
-                            160px wide. Item ID small text top-right. Pack quantity tiny near product name."
-                            </div>
-                        </div>
-
-                        <div style="margin-top:10px; color:#64748b; font-size:0.78rem;">
-                            💡 Tip: Reference field names from your JSON above (e.g. LIST_PRICE, UNIT_PRICE_UNIT)
-                            so AI maps them exactly. Mention position as: top / bottom / left / right / center /
-                            top-left / top-right / bottom-left / bottom-right.
-                        </div>
-                        </div>
-                        """)
-
-                    # ── Row 5: Quick-start label types ────────────
-                    gr.HTML("<div style='font-size:0.75rem; color:#64748b; margin:12px 0 6px; text-transform:uppercase; letter-spacing:0.08em; font-weight:500;'>Quick Start — pick a label type to pre-fill description</div>")
-                    with gr.Row():
-                        esl_btn_regular  = gr.Button("Regular",        scale=1, size="sm")
-                        esl_btn_sale     = gr.Button("Sale",            scale=1, size="sm")
-                        esl_btn_clr      = gr.Button("Clearance",       scale=1, size="sm")
-
-                    # ── Row 6: Layout description ─────────────────
-                    esl_desc_box = gr.Textbox(
-                        label="Layout Description  (edit after selecting a quick-start or write your own)",
-                        lines=6,
-                        placeholder=(
-                            "e.g. White background. Product name bold centered at top. "
-                            "Large sale price bottom-right in bold Arial. Small unit price "
-                            "bottom-left with a border box. Barcode top-right. Item ID small top-right."
-                        ),
-                    )
-
-                    esl_gen_btn = gr.Button("Generate Template", variant="primary", elem_classes="send-btn")
-                    esl_status  = gr.HTML("")
-
-                    # ── Row 5: Output ─────────────────────────────
-                    with gr.Row():
-                        esl_xsl_out = gr.Textbox(
-                            label="Generated XSL  (copy or download)",
-                            lines=18,
-                            interactive=True,
-                        )
-                        esl_json_out = gr.Textbox(
-                            label="Designer JSON  (load back in template designer for future edits)",
-                            lines=18,
-                            interactive=True,
-                        )
-
-                    with gr.Row():
-                        esl_dl_xsl  = gr.DownloadButton(label="Download .xsl",  scale=1)
-                        esl_dl_json = gr.DownloadButton(label="Download designer .json", scale=1)
-                        gr.HTML("<div style='flex:3'></div>")
+                </div>
+                """)
 
             # ── Tab 4: Wiki (placeholder) ──────────────────────
             with gr.TabItem("📖  Wiki"):
@@ -1109,39 +789,6 @@ def build():
             fn=_delete_correction,
             inputs=[del_id_box],
             outputs=[del_status, corr_df],
-        )
-
-        # ── ESL: quick-start label type buttons ──────────────
-        esl_btn_regular.click(fn=lambda: ESL_PROMPTS["regular"],   outputs=[esl_desc_box])
-        esl_btn_sale.click(   fn=lambda: ESL_PROMPTS["sale"],      outputs=[esl_desc_box])
-        esl_btn_clr.click(    fn=lambda: ESL_PROMPTS["clearance"], outputs=[esl_desc_box])
-
-        # ── ESL: upload JSON file → fill text box ─────────────
-        esl_upload.change(
-            fn=_esl_upload_fields,
-            inputs=[esl_upload],
-            outputs=[esl_fields_box],
-        )
-
-        # ── ESL: save profile ─────────────────────────────────
-        esl_save_profile_btn.click(
-            fn=_esl_save_profile,
-            inputs=[esl_company_code_box, esl_fields_box],
-            outputs=[esl_profile_status, esl_profile_dd],
-        )
-
-        # ── ESL: load profile → fill text box ─────────────────
-        esl_load_profile_btn.click(
-            fn=_esl_load_profile,
-            inputs=[esl_profile_dd],
-            outputs=[esl_fields_box, esl_profile_status],
-        )
-
-        # ── ESL: generate template ────────────────────────────
-        esl_gen_btn.click(
-            fn=_generate_esl,
-            inputs=[esl_fields_box, esl_desc_box, esl_size_dd, esl_model_dd],
-            outputs=[esl_status, esl_xsl_out, esl_json_out, esl_dl_xsl, esl_dl_json],
         )
 
     return demo
