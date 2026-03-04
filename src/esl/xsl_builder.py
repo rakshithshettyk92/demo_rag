@@ -13,9 +13,36 @@ The XSL is assembled from three parts:
 import os
 import math
 import time
+from src.esl.currency_registry import CURRENCY_REGISTRY, EURO_STYLE_CURRENCIES
 
 # Path to extracted static helper templates
 _HELPERS_PATH = os.path.join(os.path.dirname(__file__), "static", "xsl_helpers.xsl")
+
+# Formats where the currency symbol appears before the value (prefix position)
+_CURRENCY_PREFIX_FORMATS: frozenset[str] = frozenset(
+    {"format4", "format5", "format8", "format11", "format12"}
+)
+
+# ── Barcode type registry ───────────────────────────────────────────────────
+# Maps layout spec barcode_type → barcode4j XSL element name
+BARCODE_XSL_NAME: dict[str, str] = {
+    "code128":          "code128",
+    "code39":           "code39",
+    "ean128":           "ean-128",
+    "ean13":            "ean-13",
+    "ean8":             "ean-8",
+    "UPC":              "upc-a",
+    "UPCE":             "upc-e",
+    "interleaved2of5":  "intl2of5",
+    "codabar":          "NW-7(CODABAR)",
+    "pdf417":           "pdf417",
+    "qrCode":           "qr",
+    "datamatrix":       "datamatrix",
+    "azteccode":        "azteccode",
+}
+
+# 2D barcodes are square and sized by module-width, not bar height
+_2D_BARCODE_TYPES: frozenset[str] = frozenset({"qrCode", "datamatrix", "azteccode"})
 
 
 def _load_helpers() -> str:
@@ -130,6 +157,15 @@ def _build_textbox_svg(el: dict, element_id: int) -> str:
     fill_color = _fill_to_rgb(el.get("fill", "#000000"))
     fit_text = str(el.get("fit_text", False)).lower()
 
+    # ── Currency resolution ───────────────────────────────────────────────
+    cur_code   = el.get("currency_code") or ""
+    cur_fmt_type = el.get("currency_format") or ""
+    cur_info   = CURRENCY_REGISTRY.get(cur_code, {}) if cur_code else {}
+    cur_sign   = cur_info.get("icon", "") if cur_info else ""
+    # "usa" = period decimal / "euro" = comma decimal
+    cur_format = "euro" if cur_code in EURO_STYLE_CURRENCIES else ("usa" if cur_code else "")
+    cur_pos    = "start" if cur_fmt_type in _CURRENCY_PREFIX_FORMATS else "end"
+
     fw_str = "bold" if font_weight == "bold" else ""
     style = (
         "stroke: none; stroke-width: 1; stroke-dasharray: none; "
@@ -161,11 +197,11 @@ def _build_textbox_svg(el: dict, element_id: int) -> str:
         f'letter-spacing="0em"{fw_bold_attr}{fi_italic_attr} style="{style}" text-rendering="optimizeLegibility">'
         f'<xsl:call-template name="wordwrap">',
         f'          \n<xsl:with-param name="productFieldValue" {value_attr}></xsl:with-param>',
-        f'         \n<xsl:with-param name="currencyPosition" select="{q}start{q}"></xsl:with-param>',
-        f'         \n<xsl:with-param name="currencySign" select="{q}{q}"></xsl:with-param>',
-        f'         \n<xsl:with-param name="currencyFormat" select="{q}{q}"></xsl:with-param>',
-        f'         \n<xsl:with-param name="currencyFormatType" select="{q}{q}"></xsl:with-param>',
-        f'         \n<xsl:with-param name="currencyCode" select="{q}{q}"></xsl:with-param>',
+        f'         \n<xsl:with-param name="currencyPosition" select="{q}{cur_pos}{q}"></xsl:with-param>',
+        f'         \n<xsl:with-param name="currencySign" select="{q}{cur_sign}{q}"></xsl:with-param>',
+        f'         \n<xsl:with-param name="currencyFormat" select="{q}{cur_format}{q}"></xsl:with-param>',
+        f'         \n<xsl:with-param name="currencyFormatType" select="{q}{cur_fmt_type}{q}"></xsl:with-param>',
+        f'         \n<xsl:with-param name="currencyCode" select="{q}{cur_code}{q}"></xsl:with-param>',
         f'         \n<xsl:with-param name="textAnchor" select="{q}{_text_anchor(text_align)}{q}"></xsl:with-param>',
         f'         \n<xsl:with-param name="fontFamily" select="{q}{font_family}{q}"></xsl:with-param>',
         f'         \n<xsl:with-param name="fontWeight" select="{_font_weight_f(font_weight)}"></xsl:with-param>',
@@ -179,9 +215,9 @@ def _build_textbox_svg(el: dict, element_id: int) -> str:
         f'         \n<xsl:with-param name="tspanY" select="1.0"></xsl:with-param>',
         f'         \n<xsl:with-param name="textVertAlign" select="{q}{text_vert_align}{q}"></xsl:with-param>',
         f'         \n<xsl:with-param name="zeroformatEnabled" select="{q}true{q}"></xsl:with-param>',
-        f'         \n<xsl:with-param name="isToApplyUpperCase" select="{q}false{q}"></xsl:with-param>',
-        f'         \n<xsl:with-param name="isToApplyLowerCase" select="{q}false{q}"></xsl:with-param>',
-        f'         \n<xsl:with-param name="letterSpacing" select="{q}0{q}"></xsl:with-param>',
+        f'         \n<xsl:with-param name="isToApplyUpperCase" select="{q}{str(el.get("upper_case", False)).lower()}{q}"></xsl:with-param>',
+        f'         \n<xsl:with-param name="isToApplyLowerCase" select="{q}{str(el.get("lower_case", False)).lower()}{q}"></xsl:with-param>',
+        f'         \n<xsl:with-param name="letterSpacing" select="{q}{el.get("letter_spacing", 0)}{q}"></xsl:with-param>',
         f'         \n<xsl:with-param name="hideFieldByDefault" select="{q}false{q}"></xsl:with-param>',
         f'         \n<xsl:with-param name="customCurrencyThousandSeparator" select="{q}true{q}"></xsl:with-param>',
         f'         \n<xsl:with-param name="currencySignDisplacementRatioWithFontSizeX" select="{q}{q}"></xsl:with-param>',
@@ -212,12 +248,66 @@ def _build_rect_svg(el: dict, element_id: int) -> str:
     fill = el.get("fill", "transparent")
     stroke = el.get("stroke", "#000000")
     stroke_width = el.get("stroke_width", 1)
+    border_radius = el.get("border_radius", 0)
+
+    svg_fill = "none" if fill == "transparent" else fill
+    rx_attr = f'rx="{border_radius}" ry="{border_radius}" ' if border_radius else ""
+    return (
+        f'\n\t<g id="{element_id}" transform="translate({cx} {cy})">'
+        f'\n\t\t<rect x="-{hw}" y="-{hh}" width="{el["width"]}" height="{el["height"]}" '
+        f'{rx_attr}fill="{svg_fill}" stroke="{stroke}" stroke-width="{stroke_width}"></rect>'
+        f'\n\t</g>'
+    )
+
+
+def _build_circle_svg(el: dict, element_id: int) -> str:
+    cx, cy = _cx(el), _cy(el)
+    hw, hh = _half_w(el), _half_h(el)
+    fill = el.get("fill", "transparent")
+    stroke = el.get("stroke", "#000000")
+    stroke_width = el.get("stroke_width", 1)
 
     svg_fill = "none" if fill == "transparent" else fill
     return (
         f'\n\t<g id="{element_id}" transform="translate({cx} {cy})">'
-        f'\n\t\t<rect x="-{hw}" y="-{hh}" width="{el["width"]}" height="{el["height"]}" '
-        f'fill="{svg_fill}" stroke="{stroke}" stroke-width="{stroke_width}"></rect>'
+        f'\n\t\t<ellipse rx="{hw}" ry="{hh}" '
+        f'fill="{svg_fill}" stroke="{stroke}" stroke-width="{stroke_width}"></ellipse>'
+        f'\n\t</g>'
+    )
+
+
+def _build_line_svg(el: dict, element_id: int) -> str:
+    x1 = el.get("x1", 0)
+    y1 = el.get("y1", 0)
+    x2 = el.get("x2", 0)
+    y2 = el.get("y2", 0)
+    stroke = el.get("stroke", "#000000")
+    stroke_width = el.get("stroke_width", 1)
+
+    return (
+        f'\n\t<line id="{element_id}" x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" '
+        f'stroke="{stroke}" stroke-width="{stroke_width}"></line>'
+    )
+
+
+def _build_image_svg(el: dict, element_id: int) -> str:
+    """Embed a logo/image in SVG as a base64 data URI, or draw a placeholder."""
+    x, y, w, h = el["x"], el["y"], el["width"], el["height"]
+    img_data = el.get("image_data", "")
+
+    if img_data:
+        return (
+            f'\n\t<image id="{element_id}" x="{x}" y="{y}" width="{w}" height="{h}" '
+            f'xlink:href="data:image/png;base64,{img_data}" '
+            f'preserveAspectRatio="xMidYMid meet"/>'
+        )
+    # Placeholder rectangle when no image data has been injected yet
+    cx, cy = x + w // 2, y + h // 2
+    hw, hh = w // 2, h // 2
+    return (
+        f'\n\t<g id="{element_id}" transform="translate({cx} {cy})">'
+        f'\n\t\t<rect x="-{hw}" y="-{hh}" width="{w}" height="{h}" '
+        f'fill="#EEEEEE" stroke="#AAAAAA" stroke-width="1"/>'
         f'\n\t</g>'
     )
 
@@ -225,30 +315,50 @@ def _build_rect_svg(el: dict, element_id: int) -> str:
 def _build_barcode_fo(el: dict) -> str:
     """Generate Apache FOP barcode4j block-container (outside the SVG)."""
     field = el.get("field", "ITEM_ID")
-    var = _var_name(field)
-    x = el.get("x", 0)
-    y = el.get("y", 0)
-    w = el.get("width", 160)
-    h = el.get("height", 18)
-    # Convert px height to mm (approx: 1px ≈ 0.2646mm at 96dpi)
-    h_mm = round(h * 0.2646, 1)
+    var   = _var_name(field)
+    x     = el.get("x", 0)
+    y     = el.get("y", 0)
+    w     = el.get("width", 160)
+    h     = el.get("height", 18)
+
+    btype          = el.get("barcode_type", "code128")
+    xsl_tag        = BARCODE_XSL_NAME.get(btype, btype)   # fall back to raw value
+    human_readable = el.get("human_readable", "none")
+    barcode_align  = el.get("barcode_align", "left")
+
+    if btype in _2D_BARCODE_TYPES:
+        # 2D barcodes: size is driven by module-width (approx: px → mm at 96dpi)
+        w_mm       = round(w * 0.2646, 1)
+        module_w   = round(w_mm / 20, 2)           # ~20 modules across for typical symbol
+        inner = (
+            f'<barcode:{xsl_tag}>'
+            f'<barcode:module-width>{module_w}mm</barcode:module-width>'
+            f'</barcode:{xsl_tag}>'
+        )
+    else:
+        # 1D linear barcodes: height-driven
+        h_mm = round(h * 0.2646, 1)
+        inner = (
+            f'<barcode:{xsl_tag}>'
+            f'<barcode:height>{h_mm}mm</barcode:height>'
+            f'<barcode:quiet-zone enabled="false">10mw</barcode:quiet-zone>'
+            f'<barcode:module-width>1pt</barcode:module-width>'
+            f'<barcode:wide-factor>4</barcode:wide-factor>'
+            f'<barcode:human-readable><barcode:placement>{human_readable}</barcode:placement></barcode:human-readable>'
+            f'<barcode:encoding>UTF-8</barcode:encoding>'
+            f'</barcode:{xsl_tag}>'
+        )
 
     return (
         f'<fo:block-container position="absolute" reference-orientation="0" '
         f' top="{y}px" left="{x}px">'
-        f'<fo:block text-align=\'left\' line-height=\'0.9\'>'
+        f'<fo:block text-align=\'{barcode_align}\' line-height=\'0.9\'>'
         f'<xsl:if test="${var}!= \'\'">'
         f'<fo:instream-foreign-object background-color=\'white\'>'
         f'<barcode:barcode xmlns:barcode="http://barcode4j.krysalis.org/ns" '
         f'message="{{{var}}}" orientation="">'
-        f'<barcode:code128>'
-        f'<barcode:height>{h_mm}mm</barcode:height>'
-        f'<barcode:quiet-zone enabled="false">10mw</barcode:quiet-zone>'
-        f'<barcode:module-width>1pt</barcode:module-width>'
-        f'<barcode:wide-factor>4</barcode:wide-factor>'
-        f'<barcode:human-readable><barcode:placement>none</barcode:placement></barcode:human-readable>'
-        f'<barcode:encoding>UTF-8</barcode:encoding>'
-        f'</barcode:code128></barcode:barcode>'
+        f'{inner}'
+        f'</barcode:barcode>'
         f'</fo:instream-foreign-object></xsl:if>'
         f'</fo:block></fo:block-container>'
     )
@@ -288,8 +398,14 @@ def build_xsl(layout: dict) -> str:
         etype = el.get("type")
         if etype == "textbox":
             svg_elements.append(_build_textbox_svg(el, eid))
-        elif etype == "rect":
+        elif etype in ("rect", "rounded_rect"):
             svg_elements.append(_build_rect_svg(el, eid))
+        elif etype == "circle":
+            svg_elements.append(_build_circle_svg(el, eid))
+        elif etype == "line":
+            svg_elements.append(_build_line_svg(el, eid))
+        elif etype == "image":
+            svg_elements.append(_build_image_svg(el, eid))
         elif etype == "barcode":
             fo_barcodes.append(_build_barcode_fo(el))
 

@@ -12,6 +12,8 @@ Open: http://localhost:7860
 
 import os
 import sys
+import threading
+import queue as _queue
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -545,6 +547,16 @@ def _delete_correction(id_prefix):
         return f"<span style='color:#ef4444'>❌ Error: {e}</span>", _list_corrections()
 
 
+# ── ESL label registry ────────────────────────────────────────
+try:
+    from src.esl.label_registry import all_label_keys, DEFAULT_LABEL_KEY
+    _ESL_SIZE_CHOICES = all_label_keys()
+    _ESL_SIZE_DEFAULT = DEFAULT_LABEL_KEY
+except Exception:
+    _ESL_SIZE_CHOICES = ['2.5_4C" : 296 X 152']
+    _ESL_SIZE_DEFAULT = '2.5_4C" : 296 X 152'
+
+
 # ── ESL quick-start prompts ───────────────────────────────────
 ESL_PROMPTS = {
     "regular": (
@@ -648,61 +660,265 @@ def _esl_upload_fields(file):
         return f"// Error reading file: {e}"
 
 
-# ── ESL template generator handler ───────────────────────────
-def _generate_esl(fields_json: str, description: str, size_key: str, provider: str):
-    """Generate XSL + Fabric JSON from product fields and description."""
-    if not description.strip():
-        return (
-            "<span style='color:#f59e0b'>⚠️ Please enter a layout description.</span>",
-            "", "", None, None,
-        )
-    if not fields_json.strip():
-        return (
-            "<span style='color:#f59e0b'>⚠️ Please enter product fields JSON.</span>",
-            "", "", None, None,
-        )
+# ── ESL: logo dithering handler ───────────────────────────────
+def _dither_logo(logo_pil, size_key: str):
+    """Dither an uploaded logo to the ESL label's color palette."""
+    if logo_pil is None:
+        return None, None
+    try:
+        from src.esl.image_ditherer import dither_to_palette, get_palette_for_color_type
+        from src.esl.label_registry import LABEL_REGISTRY
+        reg_info   = LABEL_REGISTRY.get(size_key, {})
+        color_type = reg_info.get("best_color", "4_COLOR")
+        palette    = get_palette_for_color_type(color_type)
+        dithered   = dither_to_palette(logo_pil, palette)
+        return dithered, dithered        # (display, state)
+    except Exception as e:
+        print(f"Dithering error: {e}")
+        return logo_pil, logo_pil
 
-    yield (
-        "<span style='color:#64748b'>⏳ Generating layout spec with AI...</span>",
-        "", "", None, None,
-    )
+
+# ── ESL template generator handler ───────────────────────────
+def _generate_esl(
+    fields_json: str,
+    description: str,
+    size_key: str,
+    provider: str,
+    ref_data_json: str,
+    dithered_logo,
+):
+    """Generate XSL + Fabric JSON + live preview from product fields and description."""
+    # 7 "empty" values: xsl, json, dl_xsl, dl_json, layout_spec_state, preview, stream_box
+    _empty = ("", "", None, None, "", None, "")
+
+    if not description.strip():
+        yield ("<span style='color:#f59e0b'>⚠️ Please enter a layout description.</span>", *_empty)
+        return
+    if not fields_json.strip():
+        yield ("<span style='color:#f59e0b'>⚠️ Please enter product fields JSON.</span>", *_empty)
+        return
+
+    yield ("<span style='color:#64748b'>⏳ Sending prompt to AI...</span>", *_empty)
 
     try:
         from src.esl.template_service import get_service
         service = get_service()
 
-        yield (
-            "<span style='color:#64748b'>🔍 Building XSL and JSON files...</span>",
-            "", "", None, None,
-        )
+        # ── Stream LLM tokens in background thread ────────────────────────
+        token_q: _queue.Queue = _queue.Queue()
+        result_holder: list   = [None]   # will hold (xsl, json, spec_str) or Exception
 
-        xsl_content, fabric_json, _ = service.generate(
-            fields_json=fields_json,
-            description=description,
-            size_key=size_key,
-            provider=provider,
-        )
+        def _run():
+            try:
+                result_holder[0] = service.generate(
+                    fields_json=fields_json,
+                    description=description,
+                    size_key=size_key,
+                    provider=provider,
+                    stream_fn=lambda t: token_q.put(t),
+                )
+            except Exception as exc:
+                result_holder[0] = exc
+            finally:
+                token_q.put(None)   # sentinel — signals end of stream
 
-        # Write temp files for download buttons
-        import tempfile, os
+        threading.Thread(target=_run, daemon=True).start()
+
+        # Yield each token to the stream box so the user sees output immediately
+        tokens: list[str] = []
+        while True:
+            token = token_q.get()
+            if token is None:
+                break
+            tokens.append(token)
+            partial = "".join(tokens)
+            yield (
+                f"<span style='color:#64748b'>⏳ Generating… {len(tokens)} tokens</span>",
+                "", "", None, None, "", None, partial,
+            )
+
+        if isinstance(result_holder[0], Exception):
+            raise result_holder[0]
+
+        xsl_content, fabric_json, layout_spec_str = result_holder[0]
+
+        # ── Inject dithered logo into image elements if provided ──────────
+        import json as _json, base64 as _b64, io as _io
+        layout_spec = _json.loads(layout_spec_str)
+
+        if dithered_logo is not None:
+            buf = _io.BytesIO()
+            dithered_logo.save(buf, format="PNG")
+            logo_b64 = _b64.b64encode(buf.getvalue()).decode()
+
+            for el in layout_spec.get("elements", []):
+                if el.get("type") == "image":
+                    el["image_data"] = logo_b64
+
+            # Rebuild XSL and JSON now that image data is embedded
+            from src.esl.xsl_builder import build_xsl
+            from src.esl.fabric_json_builder import build_fabric_json
+            from src.esl.label_registry import LABEL_REGISTRY as _LR
+            _reg = _LR.get(size_key, {})
+            _color_type   = _reg.get("best_color", "4_COLOR")
+            _size_label   = _reg.get("label", size_key.split('"')[0].strip()).replace(" ", "_")
+            _tpl_name     = f"AI_{_size_label}"
+            xsl_content   = build_xsl(layout_spec)
+            fabric_json   = build_fabric_json(layout_spec, template_name=_tpl_name, color_type=_color_type)
+
+        # ── Render live preview ───────────────────────────────────────────
+        preview_img = None
+        yield ("<span style='color:#64748b'>🖼️  Rendering preview...</span>", *_empty)
+
+        try:
+            from src.esl.preview_renderer import render_preview
+            ref_data = {}
+            if ref_data_json and ref_data_json.strip():
+                try:
+                    ref_data = _json.loads(ref_data_json)
+                except Exception:
+                    pass
+            preview_img = render_preview(layout_spec, ref_data, dithered_logo)
+        except Exception as pe:
+            print(f"Preview render error: {pe}")
+
+        # ── Write temp download files ─────────────────────────────────────
+        import tempfile
         xsl_tmp  = tempfile.NamedTemporaryFile(delete=False, suffix=".xsl",  mode="w", encoding="utf-8")
         json_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w", encoding="utf-8")
         xsl_tmp.write(xsl_content);  xsl_tmp.close()
         json_tmp.write(fabric_json); json_tmp.close()
 
         yield (
-            "<span style='color:#10b981'>✅ Template generated successfully!</span>",
+            "<span style='color:#10b981'>✅ Template generated — refine below if needed.</span>",
             xsl_content,
             fabric_json,
             xsl_tmp.name,
             json_tmp.name,
+            layout_spec_str,   # stored in state so refine can pick it up
+            preview_img,
+            "",                # clear stream box
         )
 
     except Exception as e:
+        yield (f"<span style='color:#ef4444'>❌ Error: {e}</span>", *_empty)
+
+
+# ── ESL refinement handler ────────────────────────────────────
+def _refine_esl(
+    instruction: str,
+    current_layout_json: str,
+    size_key: str,
+    provider: str,
+    ref_data_json: str,
+    dithered_logo,
+):
+    """Apply a natural language refinement to the current layout spec."""
+    # 7 keep-as-is updates: xsl, json, dl_xsl, dl_json, layout_spec_state, preview, stream_box
+    _keep = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
+
+    if not instruction.strip():
+        yield "<span style='color:#f59e0b'>⚠️ Enter a refinement instruction.</span>", *_keep
+        return
+    if not current_layout_json:
+        yield "<span style='color:#f59e0b'>⚠️ Generate a template first before refining.</span>", *_keep
+        return
+
+    yield "<span style='color:#64748b'>✏️ Sending refinement to AI...</span>", *_keep
+
+    try:
+        from src.esl.template_service import get_service
+        service = get_service()
+
+        # ── Stream LLM tokens in background thread ────────────────────────
+        token_q: _queue.Queue = _queue.Queue()
+        result_holder: list   = [None]
+
+        def _run_refine():
+            try:
+                result_holder[0] = service.refine(
+                    current_layout_json=current_layout_json,
+                    instruction=instruction,
+                    size_key=size_key,
+                    provider=provider,
+                    stream_fn=lambda t: token_q.put(t),
+                )
+            except Exception as exc:
+                result_holder[0] = exc
+            finally:
+                token_q.put(None)
+
+        threading.Thread(target=_run_refine, daemon=True).start()
+
+        tokens: list[str] = []
+        while True:
+            token = token_q.get()
+            if token is None:
+                break
+            tokens.append(token)
+            partial = "".join(tokens)
+            yield (
+                f"<span style='color:#64748b'>✏️ Refining… {len(tokens)} tokens</span>",
+                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), partial,
+            )
+
+        if isinstance(result_holder[0], Exception):
+            raise result_holder[0]
+
+        xsl_content, fabric_json, layout_spec_str = result_holder[0]
+
+        # Inject logo + render preview (same pipeline as generate)
+        import json as _json, base64 as _b64, io as _io
+        layout_spec = _json.loads(layout_spec_str)
+
+        if dithered_logo is not None:
+            buf = _io.BytesIO()
+            dithered_logo.save(buf, format="PNG")
+            logo_b64 = _b64.b64encode(buf.getvalue()).decode()
+            for el in layout_spec.get("elements", []):
+                if el.get("type") == "image":
+                    el["image_data"] = logo_b64
+            from src.esl.xsl_builder import build_xsl
+            from src.esl.fabric_json_builder import build_fabric_json
+            from src.esl.label_registry import LABEL_REGISTRY as _LR
+            _reg    = _LR.get(size_key, {})
+            _ct     = _reg.get("best_color", "4_COLOR")
+            _sl     = _reg.get("label", size_key.split('"')[0].strip()).replace(" ", "_")
+            xsl_content = build_xsl(layout_spec)
+            fabric_json = build_fabric_json(layout_spec, template_name=f"AI_{_sl}", color_type=_ct)
+
+        preview_img = None
+        try:
+            from src.esl.preview_renderer import render_preview
+            ref_data = {}
+            if ref_data_json and ref_data_json.strip():
+                try:
+                    ref_data = _json.loads(ref_data_json)
+                except Exception:
+                    pass
+            preview_img = render_preview(layout_spec, ref_data, dithered_logo)
+        except Exception as pe:
+            print(f"Preview render error: {pe}")
+
+        import tempfile
+        xsl_tmp  = tempfile.NamedTemporaryFile(delete=False, suffix=".xsl",  mode="w", encoding="utf-8")
+        json_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w", encoding="utf-8")
+        xsl_tmp.write(xsl_content);  xsl_tmp.close()
+        json_tmp.write(fabric_json); json_tmp.close()
+
         yield (
-            f"<span style='color:#ef4444'>❌ Error: {e}</span>",
-            "", "", None, None,
+            "<span style='color:#10b981'>✅ Refinement applied — refine again or download.</span>",
+            xsl_content,
+            fabric_json,
+            xsl_tmp.name,
+            json_tmp.name,
+            layout_spec_str,   # updated state for next refinement
+            preview_img,
+            "",                # clear stream box
         )
+
+    except Exception as e:
+        yield f"<span style='color:#ef4444'>❌ Error: {e}</span>", *_keep
 
 
 # ── BUILD UI ──────────────────────────────────────────────────
@@ -864,10 +1080,11 @@ def build():
                     # ── Row 1: ESL size + AI model ────────────────
                     with gr.Row():
                         esl_size_dd = gr.Dropdown(
-                            choices=["2.5\" (296×152)"],
-                            value="2.5\" (296×152)",
-                            label="ESL Size",
+                            choices=_ESL_SIZE_CHOICES,
+                            value=_ESL_SIZE_DEFAULT,
+                            label="ESL Size  (54 models)",
                             scale=1,
+                            allow_custom_value=False,
                         )
                         esl_model_dd = gr.Radio(
                             choices=[
@@ -915,7 +1132,28 @@ def build():
                             value='{\n  "ITEM_NAME": "string",\n  "LIST_PRICE": "decimal",\n  "UNIT_PRICE": "decimal",\n  "UNIT_PRICE_UNIT": "string",\n  "ITEM_ID": "string",\n  "PACK_QUANTITY": "string",\n  "END_DATE": "string"\n}',
                             lines=10,
                             scale=3,
+                            elem_id="esl_fields_box",
                         )
+
+                    # ── Logo / Image upload + dithering ──────────
+                    gr.HTML("<div style='font-size:0.75rem; color:#64748b; margin:16px 0 4px; text-transform:uppercase; letter-spacing:0.08em; font-weight:500;'>Logo / Image  <span style='text-transform:none; letter-spacing:0; font-weight:400; color:#475569;'>(optional — auto-dithered to label palette)</span></div>")
+                    with gr.Row(equal_height=False):
+                        with gr.Column(scale=1):
+                            esl_logo_upload = gr.Image(
+                                label="Upload logo or product image",
+                                type="pil",
+                                image_mode="RGB",
+                                sources=["upload"],
+                                height=160,
+                            )
+                        with gr.Column(scale=1):
+                            esl_dithered_preview = gr.Image(
+                                label="Dithered preview  (colors auto-matched to label palette)",
+                                interactive=False,
+                                height=160,
+                            )
+                    esl_dithered_logo_state  = gr.State(None)
+                    esl_layout_spec_state    = gr.State("")   # holds current layout JSON for refinements
 
                     # ── Row 4: Prompt guide ───────────────────────
                     with gr.Accordion("💡 How to describe your label  (click to expand)", open=False):
@@ -991,10 +1229,172 @@ def build():
                             "Large sale price bottom-right in bold Arial. Small unit price "
                             "bottom-left with a border box. Barcode top-right. Item ID small top-right."
                         ),
+                        elem_id="esl_desc_box",
                     )
 
-                    esl_gen_btn = gr.Button("Generate Template", variant="primary", elem_classes="send-btn")
+                    # ── Field-name autocomplete (Tab / → to accept) ───
+                    gr.HTML("""
+<script>
+(function () {
+  'use strict';
+
+  var fieldNames = [];
+  var currentSuggestion = null;
+  var descTA = null;
+  var fieldsTA = null;
+  var popup = null;
+
+  /* ── popup element ── */
+  function createPopup() {
+    popup = document.createElement('div');
+    popup.id = 'esl-ac-popup';
+    popup.style.cssText =
+      'position:fixed;z-index:99999;background:#111318;border:1px solid #3b82f6;' +
+      'border-radius:8px;padding:5px 12px;font-size:0.8rem;color:#e2e8f0;' +
+      'pointer-events:none;display:none;box-shadow:0 4px 20px rgba(0,0,0,.6);' +
+      'white-space:nowrap;font-family:"DM Sans",monospace;';
+    document.body.appendChild(popup);
+  }
+
+  function showPopup(prefix, suggestion) {
+    if (!popup) createPopup();
+    var rest = suggestion.slice(prefix.length);
+    popup.innerHTML =
+      '<span style="color:#64748b;font-size:.72rem;margin-right:6px;">Tab&nbsp;/&nbsp;&#8594;</span>' +
+      '<span style="color:#e2e8f0;font-weight:600;">' + prefix + '</span>' +
+      '<span style="color:#3b82f6;">' + rest + '</span>';
+    var rect = descTA.getBoundingClientRect();
+    popup.style.left = (rect.left + 8) + 'px';
+    popup.style.top  = (rect.bottom + 5) + 'px';
+    popup.style.display = 'block';
+  }
+
+  function hidePopup() {
+    if (popup) popup.style.display = 'none';
+    currentSuggestion = null;
+  }
+
+  /* ── field-name helpers ── */
+  function parseFields(json) {
+    try { return Object.keys(JSON.parse(json)); }
+    catch (_) {
+      return (json.match(/"([A-Z][A-Z0-9_]*)"\s*:/g) || [])
+        .map(function (m) { return m.replace(/["\s:]/g, ''); });
+    }
+  }
+
+  function getPrefix(text, pos) {
+    var m = text.slice(0, pos).match(/([A-Z][A-Z0-9_]*)$/);
+    return m ? m[1] : '';
+  }
+
+  function getSuggestion(prefix) {
+    if (prefix.length < 2) return null;
+    for (var i = 0; i < fieldNames.length; i++) {
+      if (fieldNames[i] !== prefix && fieldNames[i].indexOf(prefix) === 0)
+        return fieldNames[i];
+    }
+    return null;
+  }
+
+  /* ── accept suggestion ── */
+  function accept() {
+    if (!currentSuggestion || !descTA) return;
+    var pos    = descTA.selectionStart;
+    var prefix = getPrefix(descTA.value, pos);
+    if (!prefix) return;
+    var before = descTA.value.slice(0, pos - prefix.length);
+    var after  = descTA.value.slice(pos);
+    var newVal = before + currentSuggestion + after;
+    var newPos = before.length + currentSuggestion.length;
+
+    /* update textarea and fire Gradio's input event */
+    var setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(descTA, newVal);
+    descTA.dispatchEvent(new Event('input', { bubbles: true }));
+    descTA.setSelectionRange(newPos, newPos);
+    hidePopup();
+  }
+
+  /* ── event handlers ── */
+  function onInput() {
+    var prefix = getPrefix(this.value, this.selectionStart);
+    var s = getSuggestion(prefix);
+    if (s) { currentSuggestion = s; showPopup(prefix, s); }
+    else hidePopup();
+  }
+
+  function onKeydown(e) {
+    if (!currentSuggestion) return;
+    if (e.key === 'Tab' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      accept();
+    } else if (e.key === 'Escape') {
+      hidePopup();
+    }
+  }
+
+  /* ── initialise ── */
+  function setup() {
+    fieldsTA.addEventListener('input', function () {
+      fieldNames = parseFields(this.value);
+    });
+    fieldNames = parseFields(fieldsTA.value);
+
+    descTA.addEventListener('input',   onInput);
+    descTA.addEventListener('keydown', onKeydown);
+    descTA.addEventListener('blur',    function () { setTimeout(hidePopup, 160); });
+    descTA.addEventListener('click',   hidePopup);
+    console.log('[ESL Autocomplete] ready — fields:', fieldNames);
+  }
+
+  function findTextareas() {
+    var dc = document.getElementById('esl_desc_box');
+    var fc = document.getElementById('esl_fields_box');
+    if (dc && fc) {
+      descTA   = dc.querySelector('textarea');
+      fieldsTA = fc.querySelector('textarea');
+      if (descTA && fieldsTA) return true;
+    }
+    /* fallback: search by label text */
+    document.querySelectorAll('textarea').forEach(function (ta) {
+      var lbl = (ta.closest('.form') || ta.closest('[class*="block"]') || ta.parentElement);
+      lbl = lbl && lbl.querySelector('label span, .label span');
+      if (!lbl) return;
+      if (lbl.textContent.indexOf('Layout Description') !== -1) descTA   = ta;
+      if (lbl.textContent.indexOf('fields JSON')        !== -1) fieldsTA = ta;
+    });
+    return !!(descTA && fieldsTA);
+  }
+
+  var tries = 0;
+  var ticker = setInterval(function () {
+    if (++tries > 40) { clearInterval(ticker); return; }
+    if (findTextareas()) { clearInterval(ticker); setup(); }
+  }, 500);
+})();
+</script>
+""")
+
+                    # ── Reference data for live preview ──────────
+                    gr.HTML("<div style='font-size:0.75rem; color:#64748b; margin:12px 0 4px; text-transform:uppercase; letter-spacing:0.08em; font-weight:500;'>Sample Data  <span style='text-transform:none; letter-spacing:0; font-weight:400; color:#475569;'>(for live preview — fill with real product values)</span></div>")
+                    esl_ref_data_box = gr.Textbox(
+                        label="Reference data JSON  (field_name: display_value)",
+                        placeholder='{\n  "ITEM_NAME": "Organic Whole Milk 1L",\n  "LIST_PRICE": "2.99",\n  "ITEM_ID": "SKU-001234"\n}',
+                        lines=4,
+                        value="",
+                    )
+
+                    esl_gen_btn = gr.Button("Generate Template  +  Live Preview", variant="primary", elem_classes="send-btn")
                     esl_status  = gr.HTML("")
+                    esl_stream_box = gr.Textbox(
+                        label="AI stream  (live token output — visible while model is generating)",
+                        lines=3,
+                        interactive=False,
+                        visible=True,
+                        value="",
+                        elem_id="esl_stream_box",
+                    )
 
                     # ── Row 5: Output ─────────────────────────────
                     with gr.Row():
@@ -1013,6 +1413,48 @@ def build():
                         esl_dl_xsl  = gr.DownloadButton(label="Download .xsl",  scale=1)
                         esl_dl_json = gr.DownloadButton(label="Download designer .json", scale=1)
                         gr.HTML("<div style='flex:3'></div>")
+
+                    # ── Live label preview ────────────────────────
+                    gr.HTML("<div style='font-size:0.75rem; color:#64748b; margin:16px 0 6px; text-transform:uppercase; letter-spacing:0.08em; font-weight:500;'>Live Preview  <span style='text-transform:none; letter-spacing:0; font-weight:400; color:#475569;'>(rendered with your sample data — shows final label appearance)</span></div>")
+                    esl_preview_img = gr.Image(
+                        label="Label Preview",
+                        interactive=False,
+                    )
+
+                    # ── AI Refinement ─────────────────────────────
+                    gr.HTML("""
+                    <div style='margin:20px 0 6px; padding:10px 14px; background:#0f172a;
+                                border:1px solid #1e293b; border-radius:8px;'>
+                      <div style='font-size:0.75rem; color:#64748b; text-transform:uppercase;
+                                  letter-spacing:0.08em; font-weight:500; margin-bottom:4px;'>
+                        Refine Layout
+                      </div>
+                      <div style='font-size:0.82rem; color:#94a3b8; line-height:1.5;'>
+                        Not happy with the result? Describe any change in plain English and hit
+                        <strong style='color:#e2e8f0;'>Apply Refinement</strong>.
+                        You can refine as many times as needed — each pass builds on the last.
+                        <br><br>
+                        <span style='color:#64748b;'>Examples: &nbsp;</span>
+                        <em>"Move the price to the right side"</em> &nbsp;·&nbsp;
+                        <em>"Add BRAND_NAME below the product name in grey"</em> &nbsp;·&nbsp;
+                        <em>"Make the barcode 30px taller"</em> &nbsp;·&nbsp;
+                        <em>"Add a horizontal red divider line between name and price"</em>
+                      </div>
+                    </div>
+                    """)
+                    with gr.Row():
+                        esl_refine_box = gr.Textbox(
+                            label="Refinement instruction",
+                            placeholder="e.g. Move price to center-right and make it larger",
+                            lines=2,
+                            scale=4,
+                        )
+                        esl_refine_btn = gr.Button(
+                            "Apply Refinement",
+                            variant="secondary",
+                            scale=1,
+                            min_width=140,
+                        )
 
             # ── Tab 4: Wiki (placeholder) ──────────────────────
             with gr.TabItem("📖  Wiki"):
@@ -1137,11 +1579,39 @@ def build():
             outputs=[esl_fields_box, esl_profile_status],
         )
 
-        # ── ESL: generate template ────────────────────────────
+        # ── ESL: dither logo on upload or size change ─────────
+        esl_logo_upload.change(
+            fn=_dither_logo,
+            inputs=[esl_logo_upload, esl_size_dd],
+            outputs=[esl_dithered_preview, esl_dithered_logo_state],
+        )
+        esl_size_dd.change(
+            fn=_dither_logo,
+            inputs=[esl_logo_upload, esl_size_dd],
+            outputs=[esl_dithered_preview, esl_dithered_logo_state],
+        )
+
+        # ── ESL: generate template + live preview ─────────────
+        _esl_outputs = [
+            esl_status, esl_xsl_out, esl_json_out,
+            esl_dl_xsl, esl_dl_json,
+            esl_layout_spec_state,   # keeps track of current spec for refinements
+            esl_preview_img,
+            esl_stream_box,          # live token stream during generation
+        ]
         esl_gen_btn.click(
             fn=_generate_esl,
-            inputs=[esl_fields_box, esl_desc_box, esl_size_dd, esl_model_dd],
-            outputs=[esl_status, esl_xsl_out, esl_json_out, esl_dl_xsl, esl_dl_json],
+            inputs=[esl_fields_box, esl_desc_box, esl_size_dd, esl_model_dd,
+                    esl_ref_data_box, esl_dithered_logo_state],
+            outputs=_esl_outputs,
+        )
+
+        # ── ESL: refine layout ────────────────────────────────
+        esl_refine_btn.click(
+            fn=_refine_esl,
+            inputs=[esl_refine_box, esl_layout_spec_state, esl_size_dd, esl_model_dd,
+                    esl_ref_data_box, esl_dithered_logo_state],
+            outputs=_esl_outputs,
         )
 
     return demo

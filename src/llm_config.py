@@ -25,16 +25,17 @@ OLLAMA_EMBED = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 GEMMA_MODEL  = os.getenv("GEMMA_MODEL", "gemma2:2b")  # gemma2:2b | gemma2 | gemma2:27b
 
 
-def get_llm(provider: str = None, temperature: float = 0.0):
+def get_llm(provider: str = None, temperature: float = 0.0, json_mode: bool = False):
     """
     Returns a LangChain LLM object for the given provider.
 
     Usage:
-        get_llm()               # uses LLM_PROVIDER from .env
-        get_llm("ollama")       # Ollama with OLLAMA_LLM_MODEL from .env
-        get_llm("gemma")        # Ollama with GEMMA_MODEL from .env
-        get_llm("anthropic")    # Claude (needs ANTHROPIC_API_KEY)
-        get_llm("openai")       # GPT (needs OPENAI_API_KEY)
+        get_llm()                          # uses LLM_PROVIDER from .env
+        get_llm("ollama")                  # Ollama with OLLAMA_LLM_MODEL from .env
+        get_llm("gemma")                   # Ollama with GEMMA_MODEL from .env
+        get_llm("anthropic")               # Claude (needs ANTHROPIC_API_KEY)
+        get_llm("openai")                  # GPT (needs OPENAI_API_KEY)
+        get_llm("ollama", json_mode=True)  # forces JSON-only output (faster, no fences)
     """
     provider = (provider or PROVIDER).lower()
 
@@ -43,11 +44,11 @@ def get_llm(provider: str = None, temperature: float = 0.0):
         try:
             from langchain_ollama import ChatOllama
             print(f"🤖 LLM: Ollama / {OLLAMA_LLM} (FREE, local)")
-            return ChatOllama(
-                base_url=OLLAMA_URL,
-                model=OLLAMA_LLM,
-                temperature=temperature,
-            )
+            kwargs = {"base_url": OLLAMA_URL, "model": OLLAMA_LLM, "temperature": temperature}
+            if json_mode:
+                kwargs["format"] = "json"
+                kwargs["num_ctx"] = 4096
+            return ChatOllama(**kwargs)
         except ImportError:
             raise ImportError("Run: pip install langchain-ollama")
 
@@ -58,11 +59,11 @@ def get_llm(provider: str = None, temperature: float = 0.0):
             print(f"🤖 LLM: Gemma / {GEMMA_MODEL} (FREE, local via Ollama)")
             print(f"   💡 To change model size set GEMMA_MODEL in .env")
             print(f"      Options: gemma2:2b (fastest) | gemma2 (balanced) | gemma2:27b (best)")
-            return ChatOllama(
-                base_url=OLLAMA_URL,
-                model=GEMMA_MODEL,
-                temperature=temperature,
-            )
+            kwargs = {"base_url": OLLAMA_URL, "model": GEMMA_MODEL, "temperature": temperature}
+            if json_mode:
+                kwargs["format"] = "json"
+                kwargs["num_ctx"] = 4096
+            return ChatOllama(**kwargs)
         except ImportError:
             raise ImportError("Run: pip install langchain-ollama")
 

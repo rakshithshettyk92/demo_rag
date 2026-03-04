@@ -25,3 +25,7 @@ gradio>=4.0.0
 # Utilities
 python-dotenv>=1.0.0
 rich>=13.0.0
+
+# Image processing (ESL preview + dithering)
+Pillow>=10.0.0
+numpy>=1.24.0
